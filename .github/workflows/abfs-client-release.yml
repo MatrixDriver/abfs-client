@@ -1,0 +1,55 @@
+name: Publish signed AgentBaseFS release
+
+on:
+  push:
+    branches:
+      - 'staging/abfs-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.10.0
+      - name: Authenticate and inspect every asset
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#staging/}
+          case "$tag" in abfs-v*) ;; *) echo 'invalid staging branch' >&2; exit 1 ;; esac
+          test -s release-assets/SHA256SUMS
+          test -s release-assets/SHA256SUMS.sigstore.json
+          test "$(find release-assets -maxdepth 1 -name '*.tar.gz' | wc -l | tr -d ' ')" = 4
+          test "$(wc -l < release-assets/SHA256SUMS | tr -d ' ')" = 4
+          for arch in arm64 x86_64; do
+            for profile in agent trusted; do
+              asset="abfs-macos-${arch}-${profile}.tar.gz"
+              test -s "release-assets/$asset"
+              test "$(tar -tzf "release-assets/$asset")" = abfs
+              test "$(awk -v name="$asset" '$2 == name { count++ } END { print count+0 }' release-assets/SHA256SUMS)" = 1
+            done
+          done
+          (cd release-assets && shasum -a 256 -c SHA256SUMS)
+          cosign verify-blob \
+            --bundle release-assets/SHA256SUMS.sigstore.json \
+            --certificate-identity "https://github.com/MatrixDriver/lakeon/.github/workflows/abfs-client-release.yml@refs/tags/$tag" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            release-assets/SHA256SUMS
+          grep -Eq '^[0-9a-f]{40}$' release-assets/source-commit.txt
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=${GITHUB_REF_NAME#staging/}
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "release $tag already exists; refusing to overwrite it" >&2
+            exit 1
+          fi
+          source_commit=$(cat release-assets/source-commit.txt)
+          printf 'AgentBaseFS macOS binaries from private source commit `%s`.\n\n' "$source_commit" > release-notes.md
+          printf 'Includes arm64 and x86_64 Agent and trusted builds. SHA256SUMS is signed by the private lakeon release workflow.\n' >> release-notes.md
+          gh release create "$tag" release-assets/*.tar.gz release-assets/SHA256SUMS \
+            release-assets/SHA256SUMS.sigstore.json --target main --title "$tag" --notes-file release-notes.md
